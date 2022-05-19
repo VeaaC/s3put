@@ -1,0 +1,20 @@
+[package]
+name = "s3put"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+keywords = ["aws","s3"]
+description = "Upload a single file/stream to S3 using chunks"
+homepage = "https://github.com/VeaaC/s3put"
+repository = "https://github.com/VeaaC/s3put"
+
+[dependencies]
+structopt = "0.3.25"
+anyhow = "1.0.52"
+crossbeam = "0.8.1"
+rusoto_core = "0.47.0"
+rusoto_s3 = "0.47.0"
+futures = "0.3"
+num_cpus = "1.13.1"
+tokio = { version = "1.17.0", features = ["rt-multi-thread", "fs", "sync"] }
+http = "0.2.6"
