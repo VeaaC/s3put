@@ -1,4 +1,4 @@
-# S3Get
+# S3Put
 
 [<img alt="build" src="https://img.shields.io/github/workflow/status/VeaaC/s3put/Shuffly%20CI/main?style=for-the-badge">](https://github.com/Veaac/s3put/actions?query=branch%3Amain)
 
@@ -20,6 +20,6 @@ The CLI app can be installed with [Cargo](https://doc.rust-lang.org/cargo/gettin
 cargo install s3put
 ```
 
-## Why S3Get?
+## Why S3Put?
 
 Because neither s5cmd, s3cmd, nor aws-cli can offer fast parallel uploads while piping from stdin
