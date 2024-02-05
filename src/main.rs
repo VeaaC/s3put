@@ -1,17 +1,12 @@
+use aws_sdk_s3 as s3;
+use aws_sdk_s3::types::CompletedMultipartUpload;
+use aws_sdk_s3::types::CompletedPart;
+use clap::Parser;
 use crossbeam::channel;
 use http::StatusCode;
-use rusoto_core::RusotoError;
-use rusoto_s3::AbortMultipartUploadRequest;
-use rusoto_s3::CompleteMultipartUploadRequest;
-use rusoto_s3::CompletedMultipartUpload;
-use rusoto_s3::CompletedPart;
-use rusoto_s3::CreateMultipartUploadRequest;
-use rusoto_s3::UploadPartRequest;
-use rusoto_s3::{S3Client, S3};
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::Duration;
-use structopt::StructOpt;
 
 fn parse_size(x: &str) -> anyhow::Result<usize> {
     let x = x.to_ascii_lowercase();
@@ -27,56 +22,67 @@ fn parse_size(x: &str) -> anyhow::Result<usize> {
     anyhow::bail!("Cannot parse size: '{}'", x)
 }
 
-#[derive(StructOpt, Debug)]
-#[structopt(name = "s3put")]
+#[derive(Parser)]
+#[command(author, version, about, long_about = None)]
 struct Args {
     /// S3 path to upload to
     s3_path: String,
 
-    /// input file name
-    #[structopt(long, short = "i")]
+    /// Input file name
+    #[arg(long, short)]
     input: Option<PathBuf>,
 
-    /// block size used for data uploads
-    #[structopt(long, default_value = "32MB", parse(try_from_str=parse_size))]
+    /// Block size used for data uploads
+    #[arg(long, default_value = "32MB", value_parser = parse_size)]
     block_size: usize,
 
-    /// number of threads to use, defaults to number of logical cores
-    #[structopt(long, short = "t", default_value = "6")]
+    /// Number of threads to use, defaults to number of logical cores
+    #[arg(long, short, default_value = "6")]
     threads: usize,
 
     /// Print verbose information, statistics, etc
-    #[structopt(long, short = "v")]
-    verbose: bool,
+    #[arg(short, long, action = clap::ArgAction::Count)]
+    verbose: u8,
 
     /// Determines how often each chunk should be retried before giving up
-    #[structopt(long, default_value = "4")]
+    #[arg(long, default_value = "4")]
     max_retries: u32,
 }
 
 async fn start_upload(
     bucket: &str,
     key: &str,
-    verbose: bool,
-) -> anyhow::Result<(rusoto_core::Region, String)> {
-    let mut region: rusoto_core::Region = Default::default();
+    verbose: u8,
+) -> anyhow::Result<(aws_config::SdkConfig, String)> {
+    let config = aws_config::load_from_env().await;
+    let region = config.region().cloned();
+    let mut config = config
+        .into_builder()
+        .region(region.or_else(|| Some(s3::config::Region::new("us-east-2"))))
+        .build();
+
     for _ in 0..3 {
-        let client = S3Client::new(region.clone());
+        let client = s3::Client::new(&config);
         let response = match client
-            .create_multipart_upload(CreateMultipartUploadRequest {
-                bucket: bucket.to_string(),
-                key: key.to_string(),
-                ..Default::default()
-            })
+            .create_multipart_upload()
+            .bucket(bucket)
+            .key(key)
+            .send()
             .await
         {
             Ok(x) => x,
             Err(e) => {
-                if let RusotoError::Unknown(response) = &e {
-                    if response.status == StatusCode::MOVED_PERMANENTLY {
-                        if let Some(x) = response.headers.get("x-amz-bucket-region") {
-                            region = x.parse()?;
-                            if verbose {
+                if verbose > 1 {
+                    eprintln!("{:?}", e);
+                }
+                if let s3::error::SdkError::ServiceError(response) = &e {
+                    if response.raw().status().as_u16() == StatusCode::MOVED_PERMANENTLY {
+                        if let Some(x) = response.raw().headers().get("x-amz-bucket-region") {
+                            config = config
+                                .into_builder()
+                                .region(Some(s3::config::Region::new(x.to_string())))
+                                .build();
+                            if verbose > 0 {
                                 eprintln!("Redirected to {}", x);
                             }
                             continue;
@@ -90,7 +96,10 @@ async fn start_upload(
             None => anyhow::bail!("Could not get upload_id"),
             Some(x) => x,
         };
-        return Ok((region, upload_id));
+        if verbose > 1 {
+            eprintln!("Starting upload, upload_id = {upload_id}")
+        }
+        return Ok((config, upload_id));
     }
     anyhow::bail!("Stopped following redirects after 3 hops")
 }
@@ -101,7 +110,7 @@ async fn upload(
     key: String,
     mut input: Box<dyn std::io::Read + Send + Sync>,
     num_tokens: usize,
-    region: rusoto_core::Region,
+    config: &aws_config::SdkConfig,
     upload_id: String,
 ) -> anyhow::Result<()> {
     // add initial tokens
@@ -139,32 +148,33 @@ async fn upload(
 
         wait_for_part()?;
 
-        let region = region.clone();
+        let config = config.clone();
         let max_retries = args.max_retries;
         let bucket = bucket.to_string();
         let key = key.to_string();
         let upload_id = upload_id.to_string();
         let token_sender = token_sender.clone();
         tokio::spawn(async move {
-            let client = S3Client::new(region);
+            let client = s3::Client::new(&config);
             let mut retry_count = 0;
             let result = loop {
                 match client
-                    .upload_part(UploadPartRequest {
-                        body: Some(buffer.clone().into()),
-                        bucket: bucket.to_string(),
-                        key: key.to_string(),
-                        upload_id: upload_id.to_string(),
-                        part_number,
-                        ..Default::default()
-                    })
+                    .upload_part()
+                    .body(buffer.clone().into())
+                    .bucket(&bucket)
+                    .key(&key)
+                    .upload_id(&upload_id)
+                    .part_number(part_number)
+                    .send()
                     .await
                 {
                     Ok(response) => {
-                        break Ok(Some(CompletedPart {
-                            e_tag: response.e_tag,
-                            part_number: Some(part_number),
-                        }))
+                        break Ok(Some(
+                            CompletedPart::builder()
+                                .e_tag(response.e_tag.unwrap_or("".to_string()))
+                                .part_number(part_number)
+                                .build(),
+                        ))
                     }
                     Err(e) => {
                         retry_count += 1;
@@ -192,17 +202,18 @@ async fn upload(
     // finalize upload
 
     part_results.sort_by_key(|x| x.part_number);
-    let client = S3Client::new(region);
+    let client = s3::Client::new(config);
     client
-        .complete_multipart_upload(CompleteMultipartUploadRequest {
-            bucket: bucket.to_string(),
-            key: key.to_string(),
-            upload_id: upload_id.to_string(),
-            multipart_upload: Some(CompletedMultipartUpload {
-                parts: Some(part_results),
-            }),
-            ..Default::default()
-        })
+        .complete_multipart_upload()
+        .bucket(bucket)
+        .key(key)
+        .upload_id(upload_id)
+        .multipart_upload(
+            CompletedMultipartUpload::builder()
+                .set_parts(Some(part_results))
+                .build(),
+        )
+        .send()
         .await?;
 
     Ok(())
@@ -236,7 +247,7 @@ async fn run(args: &Args) -> anyhow::Result<()> {
     let num_tokens = 2 * args.threads;
 
     // start multi-part upload
-    let (region, upload_id) = start_upload(&bucket, &key, args.verbose).await?;
+    let (config, upload_id) = start_upload(&bucket, &key, args.verbose).await?;
 
     if let Err(e) = upload(
         args,
@@ -244,20 +255,19 @@ async fn run(args: &Args) -> anyhow::Result<()> {
         key.clone(),
         input,
         num_tokens,
-        region.clone(),
+        &config,
         upload_id.clone(),
     )
     .await
     {
         eprintln!("Aborting upload: {e}");
-        let client = S3Client::new(region);
+        let client = s3::Client::new(&config);
         client
-            .abort_multipart_upload(AbortMultipartUploadRequest {
-                bucket,
-                key,
-                upload_id,
-                ..Default::default()
-            })
+            .abort_multipart_upload()
+            .bucket(bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .send()
             .await?;
         anyhow::bail!("Failed upload");
     }
@@ -266,7 +276,7 @@ async fn run(args: &Args) -> anyhow::Result<()> {
 }
 
 fn main() {
-    let args = Args::from_args();
+    let args = Args::parse();
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(args.threads + 2) // we need 2 extra threads for blocking I/O
